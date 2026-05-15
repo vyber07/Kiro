@@ -19,6 +19,19 @@ const BATCH_SIZE = 10;
 const MAX_TITLE_LENGTH = 500;
 const MAX_BODY_LENGTH = 10000;
 
+// Candidate-pool tuning
+// How far back to include not-yet-triaged issues as duplicate candidates.
+// Override via env var DUPLICATE_RECENT_WINDOW_HOURS.
+const RECENT_WINDOW_HOURS = parseInt(
+  process.env.DUPLICATE_RECENT_WINDOW_HOURS ?? "72",
+  10
+);
+
+// Labels that disqualify an issue from being a duplicate candidate
+const EXCLUDE_LABELS = new Set<string>([
+  "duplicate",
+]);
+
 /**
  * Sanitize user input to prevent prompt injection attacks
  */
@@ -64,16 +77,26 @@ function sanitizePromptInput(input: string, maxLength: number): string {
 }
 
 /**
- * Fetch existing open issues from repository with Bug or Feature type
- * Falls back to bug/feature labels if issue types are not configured
+ * Fetch existing open issues from repository as duplicate candidates.
+ *
+ * Candidate pool:
+ *  1. Already-triaged issues marked as Bug or Feature (by issue type or label).
+ *  2. Recently created, not-yet-triaged issues (within RECENT_WINDOW_HOURS).
+ *     This catches near-simultaneous reports that haven't been labeled yet.
+ *
+ * Always excluded: the current issue, pull requests, and issues carrying
+ * disqualifying labels (spam/invalid/wontfix/duplicate).
  */
 export async function fetchExistingIssues(
   owner: string,
   repo: string,
   currentIssueNumber: number,
-  githubToken: string
+  githubToken: string,
+  opts: { recentWindowHours?: number } = {}
 ): Promise<IssueData[]> {
   const client = new Octokit({ auth: githubToken });
+  const windowHours = opts.recentWindowHours ?? RECENT_WINDOW_HOURS;
+  const recentCutoff = new Date(Date.now() - windowHours * 60 * 60 * 1000);
 
   try {
     // Fetch all open issues (up to 1000 for better duplicate detection)
@@ -107,34 +130,83 @@ export async function fetchExistingIssues(
       page++;
     }
 
-    // Filter for Bug or Feature types, or bug/feature labels
+    const getLabelNames = (issue: any): string[] =>
+      issue.labels.map((l: any) =>
+        typeof l === "string" ? l.toLowerCase() : (l.name || "").toLowerCase()
+      );
+
+    const isBugOrFeature = (issue: any): boolean => {
+      if (
+        issue.type &&
+        typeof issue.type === "object" &&
+        issue.type.name &&
+        (issue.type.name === "Bug" || issue.type.name === "Feature")
+      ) {
+        return true;
+      }
+      const labelNames = getLabelNames(issue);
+      return labelNames.includes("bug") || labelNames.includes("feature");
+    };
+
+    const hasExcludedLabel = (issue: any): boolean =>
+      getLabelNames(issue).some((n) => EXCLUDE_LABELS.has(n));
+
+    // Recently created issues that haven't been triaged yet.
+    // Triaged = has a Bug/Feature type or a bug/feature label.
+    // Untriaged = pending-triage label, or no type and no bug/feature label.
+    const isRecentUntriaged = (issue: any): boolean => {
+      if (new Date(issue.created_at) < recentCutoff) return false;
+
+      const labelNames = getLabelNames(issue);
+      if (labelNames.includes("pending-triage")) return true;
+
+      const hasType = !!(issue.type && issue.type.name);
+      return (
+        !hasType &&
+        !labelNames.includes("bug") &&
+        !labelNames.includes("feature")
+      );
+    };
+
+    let triagedCount = 0;
+    let recentUntriagedCount = 0;
+
     const filteredIssues = allIssues.filter((issue: any) => {
       // Exclude current issue and pull requests
       if (issue.number === currentIssueNumber || issue.pull_request) {
         return false;
       }
 
-      // Check if issue has Bug or Feature type (type is an object with a name property)
-      if (issue.type && typeof issue.type === 'object' && issue.type.name) {
-        if (issue.type.name === "Bug" || issue.type.name === "Feature") {
-          return true;
-        }
+      // Exclude noise (duplicate)
+      if (hasExcludedLabel(issue)) {
+        return false;
       }
 
-      // Fallback: Check for bug or feature labels
-      const labelNames = issue.labels.map((l: any) =>
-        typeof l === "string" ? l.toLowerCase() : (l.name || "").toLowerCase()
-      );
-      return labelNames.includes("bug") || labelNames.includes("feature");
+      if (isBugOrFeature(issue)) {
+        triagedCount++;
+        return true;
+      }
+
+      if (isRecentUntriaged(issue)) {
+        recentUntriagedCount++;
+        return true;
+      }
+
+      return false;
     });
 
-    const hasTypes = allIssues.some(i => i.type && i.type.name);
+    const hasTypes = allIssues.some(
+      (i) => i.type && typeof i.type === "object" && i.type.name
+    );
     const filterMethod = hasTypes
-      ? "issue types (Bug/Feature)" 
+      ? "issue types (Bug/Feature)"
       : "labels (bug/feature)";
 
     console.log(
-      `Filtered ${filteredIssues.length} issues with Bug/Feature type (from ${allIssues.length} total) using ${filterMethod}`
+      `Candidates: ${filteredIssues.length} ` +
+        `(${triagedCount} triaged via ${filterMethod}, ` +
+        `${recentUntriagedCount} recent untriaged within ${windowHours}h, ` +
+        `from ${allIssues.length} total open issues)`
     );
 
     return filteredIssues.map((issue: any) => ({
